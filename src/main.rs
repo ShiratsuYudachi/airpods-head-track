@@ -327,17 +327,27 @@ fn capture(conn: &BtConnection, seconds: f32) -> Vec<RawSample> {
     out
 }
 
-/// Print a prompt, count down, then record for `seconds`.
-fn guided_capture(conn: &BtConnection, step: &str, prompt: &str, seconds: f32) -> Vec<RawSample> {
+/// Explain the step, count down while the user faces the screen, then record
+/// for `seconds` while showing `go`.
+fn guided_capture(
+    conn: &BtConnection,
+    step: &str,
+    how: &[&str],
+    go: &str,
+    seconds: f32,
+) -> Vec<RawSample> {
     info!("");
-    info!("{step}  {prompt}");
+    info!("{step}");
+    for line in how {
+        info!("      {line}");
+    }
     for n in (1..=3).rev() {
-        info!("      starting in {n}...");
+        info!("      Face the screen, hold still... {n}");
         drain_packets(conn, 1.0);
     }
-    info!("      GO ({seconds:.0} s)");
+    info!("      >>> GO: {go} ({seconds:.0} s)");
     let samples = capture(conn, seconds);
-    info!("      done.");
+    info!("      Stop. Face the screen.");
     samples
 }
 
@@ -349,9 +359,16 @@ fn run_calibration(conn: &BtConnection, calibration_path: &Path) -> Result<Calib
 
     info!("");
     info!("=== Guided calibration ===");
-    info!("Sit as you play. Move smoothly, only the named axis, and start in the named direction.");
+    info!("Sit as you play. Every motion starts and ends facing the screen.");
+    info!("Move only the named axis, smoothly, and go the named direction first.");
 
-    let neutral_raw = guided_capture(conn, "1/4", "Look straight ahead and hold still.", 2.0);
+    let neutral_raw = guided_capture(
+        conn,
+        "1/4  CENTRE",
+        &["Face the screen, head level, as you normally play."],
+        "hold still",
+        2.0,
+    );
     if neutral_raw.len() < 10 {
         bail!("no head-tracking data while capturing the neutral pose");
     }
@@ -364,20 +381,32 @@ fn run_calibration(conn: &BtConnection, calibration_path: &Path) -> Result<Calib
 
     let pitch_raw = guided_capture(
         conn,
-        "2/4",
-        "NOD: first look DOWN, then keep nodding down and up (~20-30 deg). Do not turn or tilt.",
+        "2/4  NOD (pitch)",
+        &[
+            "Chin DOWN toward your chest (~20 deg), then UP past centre (~20 deg), repeat.",
+            "Keep facing the screen: no turning, no tilting.",
+        ],
+        "chin DOWN first, then up / down",
         MOTION_SECONDS,
     );
     let yaw_raw = guided_capture(
         conn,
-        "3/4",
-        "TURN: first turn RIGHT, then keep turning right and left (~30-45 deg). Keep your chin level.",
+        "3/4  TURN (yaw)",
+        &[
+            "Turn your face to the RIGHT (~40 deg), then to the LEFT (~40 deg), repeat.",
+            "Keep your chin level: no nodding, no tilting.",
+        ],
+        "face RIGHT first, then right / left",
         MOTION_SECONDS,
     );
     let roll_raw = guided_capture(
         conn,
-        "4/4",
-        "TILT: first tilt your RIGHT ear to your shoulder, then keep tilting right and left. Keep facing forward.",
+        "4/4  TILT (roll)",
+        &[
+            "RIGHT ear down toward your right shoulder (~20 deg), then LEFT ear down, repeat.",
+            "Keep facing the screen: no turning, no nodding.",
+        ],
+        "RIGHT ear down first, then right / left",
         MOTION_SECONDS,
     );
 
