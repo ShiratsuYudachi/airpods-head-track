@@ -14,7 +14,9 @@ use anyhow::{bail, Result};
 use bluetooth::BtConnection;
 use calibration::Sample;
 use clap::Parser;
-use head_tracking::{raw_orientation, wrap_delta, wrap_mean, Calibration, HeadTracker};
+use head_tracking::{
+    mean_quat, quat_from_raw, raw_orientation, rotation_vector_deg, Calibration, HeadTracker,
+};
 use log::{error, info, warn};
 use opentrack::OpenTrackSender;
 use std::io::Write;
@@ -150,7 +152,7 @@ fn main() -> Result<()> {
         Some(path) => {
             let file = std::fs::File::create(path)?;
             let mut writer = std::io::BufWriter::new(file);
-            writeln!(writer, "t,o1,o2,o3,o4,h,v")?;
+            writeln!(writer, "t,len,sub,o1,o2,o3,o4,h,v,pitch,yaw,roll,hex")?;
             info!("Raw orientation log: {}", path.display());
             Some(writer)
         }
@@ -200,24 +202,35 @@ fn main() -> Result<()> {
                 if AacpManager::is_head_tracking_packet(packet) {
                     tracking_packets += 1;
 
+                    let result = tracker.process_packet(packet);
+
                     if let Some(writer) = &mut raw_log {
                         let s =
                             |off: usize| i16::from_le_bytes([packet[off], packet[off + 1]]) as i32;
+                        let out = match &result {
+                            Some((o, _)) => format!("{:.2},{:.2},{:.2}", o.pitch, o.yaw, o.roll),
+                            None => ",,".to_string(),
+                        };
+                        let hex: String = packet.iter().map(|b| format!("{b:02x}")).collect();
                         let _ = writeln!(
                             writer,
-                            "{:.4},{},{},{},{},{},{}",
+                            "{:.4},{},{:02x},{},{},{},{},{},{},{},{}",
                             log_start.elapsed().as_secs_f64(),
+                            packet.len(),
+                            packet[10],
                             s(43),
                             s(45),
                             s(47),
                             s(49),
                             s(51),
-                            s(53)
+                            s(53),
+                            out,
+                            hex
                         );
                         let _ = writer.flush();
                     }
 
-                    if let Some((mut orientation, _acceleration)) = tracker.process_packet(packet) {
+                    if let Some((mut orientation, _acceleration)) = result {
                         // Apply sensitivity multiplier
                         orientation.pitch *= args.sensitivity;
                         orientation.yaw *= args.sensitivity;
@@ -329,37 +342,42 @@ fn guided_capture(conn: &BtConnection, step: &str, prompt: &str, seconds: f32) -
 }
 
 /// Guided calibration: capture the neutral pose, then one continuous
-/// oscillation per head axis, and fit the decoupling matrix by regression.
+/// oscillation per head axis, and fit the IMU mounting from the rotations.
 /// The raw recording is kept next to the calibration file for diagnosis.
 fn run_calibration(conn: &BtConnection, calibration_path: &Path) -> Result<Calibration> {
-    const MOTION_SECONDS: f32 = 8.0;
+    const MOTION_SECONDS: f32 = 4.0;
 
     info!("");
     info!("=== Guided calibration ===");
-    info!("Sit as you play. Move slowly and smoothly; only the named axis.");
+    info!("Sit as you play. Move smoothly, only the named axis, and start in the named direction.");
 
     let neutral_raw = guided_capture(conn, "1/4", "Look straight ahead and hold still.", 2.0);
     if neutral_raw.len() < 10 {
         bail!("no head-tracking data while capturing the neutral pose");
     }
-    let neutral = wrap_mean(&neutral_raw.iter().map(|s| s.1).collect::<Vec<_>>());
+    let neutral = mean_quat(
+        &neutral_raw
+            .iter()
+            .map(|s| quat_from_raw(s.1))
+            .collect::<Vec<_>>(),
+    );
 
     let pitch_raw = guided_capture(
         conn,
         "2/4",
-        "NOD: look down and up repeatedly (~20-30 deg each way). Do not turn or tilt.",
+        "NOD: first look DOWN, then keep nodding down and up (~20-30 deg). Do not turn or tilt.",
         MOTION_SECONDS,
     );
     let yaw_raw = guided_capture(
         conn,
         "3/4",
-        "TURN: look left and right repeatedly (~30-45 deg each way). Keep your chin level.",
+        "TURN: first turn RIGHT, then keep turning right and left (~30-45 deg). Keep your chin level.",
         MOTION_SECONDS,
     );
     let roll_raw = guided_capture(
         conn,
         "4/4",
-        "TILT: lean your head ear-to-shoulder, left and right repeatedly. Keep facing forward.",
+        "TILT: first tilt your RIGHT ear to your shoulder, then keep tilting right and left. Keep facing forward.",
         MOTION_SECONDS,
     );
 
@@ -378,19 +396,14 @@ fn run_calibration(conn: &BtConnection, calibration_path: &Path) -> Result<Calib
         info!("Raw calibration recording: {}", raw_path.display());
     }
 
-    let to_deltas = |raw: &[RawSample]| -> Vec<Sample> {
+    let to_samples = |raw: &[RawSample]| -> Vec<Sample> {
         raw.iter()
-            .map(|(t, r)| {
-                (
-                    *t,
-                    std::array::from_fn(|c| wrap_delta(r[c], neutral[c]) as f64),
-                )
-            })
+            .map(|(t, r)| (*t, rotation_vector_deg(&neutral, &quat_from_raw(*r))))
             .collect()
     };
-    let pitch = to_deltas(&pitch_raw);
-    let yaw = to_deltas(&yaw_raw);
-    let roll = to_deltas(&roll_raw);
+    let pitch = to_samples(&pitch_raw);
+    let yaw = to_samples(&yaw_raw);
+    let roll = to_samples(&roll_raw);
 
     let cal = calibration::build_calibration(
         calibration::fit_axis(&pitch)?,

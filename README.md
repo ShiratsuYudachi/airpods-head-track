@@ -10,6 +10,8 @@ AirPods (particularly AirPods Pro and later) broadcast head tracking data over B
 2. This tool enumerates connected AirPods via the driver's device interface GUID (`{9eec98bb-3c54-45d4-a843-7900c4635e08}`), opens a handle with `CreateFile`, and performs AACP handshake/communication over overlapped `ReadFile`/`WriteFile`.
 3. Head tracking orientation data is parsed from AACP packets, calibrated to a neutral position, and sent to OpenTrack as 6 doubles (yaw, pitch, roll) over UDP on `127.0.0.1:4242`.
 
+The three orientation channels at packet offsets 43/45/47 are the vector part `(x, y, z)` of the sensor's orientation quaternion in Q15. The scalar part is not sent; it is implied as `w = sqrt(1 - |v|²) ≥ 0`. Whenever the true `w` crosses zero the AirPods therefore flip the sign of all three channels (`q` and `-q` are the same rotation). Head motion is computed as the quaternion rotation from the neutral pose, so these flips have no effect on the output.
+
 ## Prerequisites
 
 ### MagicAAP Driver
@@ -60,9 +62,9 @@ The IMU inside each AirPod sits at an angle to your head, so with the default fo
 airpods-head-track --mac AA:BB:CC:DD:EE:FF --calibrate
 ```
 
-Follow the prompts: hold still, then nod, turn, and tilt (ear to shoulder), each for 8 seconds, moving only the named axis. For each motion the tool removes slow drift, fits the principal direction of the raw `(o1, o2, o3)` channels, and inverts the resulting 3×3 mixing matrix, so pitch, yaw and roll are decoupled. It rejects motions that are too small, mixed with other axes, or not independent, and reports the remaining leakage per axis.
+Follow the prompts: hold still, then nod (start by looking **down**), turn (start **right**) and tilt (start with the **right** ear toward the shoulder), each for 4 seconds, moving only the named axis. Every sample is the rotation from the neutral pose in the sensor frame; for each motion the tool removes slow drift and fits the principal rotation axis, whose sign is set by your first move. The three axes are squared up into an orthonormal head frame (the IMU mounting), and the output is yaw, then pitch, then roll in that frame. Motions that are too small, mixed with other axes, or not independent are rejected, and the remaining leakage per axis is reported.
 
-The matrix is saved to `%APPDATA%\airpods-head-track\calibration.txt` (raw recording in `calibration_raw.csv` next to it) and loaded automatically on later runs. A calibrated run also outputs roll; flatten it in OpenTrack's Mapping if you do not want it.
+The calibration is saved to `%APPDATA%\airpods-head-track\calibration.txt` (raw recording in `calibration_raw.csv` next to it) and loaded automatically on later runs. Calibration files from older versions are ignored with a warning; run `--calibrate` again. A calibrated run also outputs roll; flatten it in OpenTrack's Mapping if you do not want it.
 
 ### Options
 
@@ -75,8 +77,8 @@ The matrix is saved to `%APPDATA%\airpods-head-track\calibration.txt` (raw recor
 | `--sensitivity` | Sensitivity multiplier | `1.0` |
 | `--calibrate` | Run the guided calibration, save it, then track | off |
 | `--calibration-file` | Calibration file to load/save | `%APPDATA%\airpods-head-track\calibration.txt` |
-| `--mix-angle` | Uncalibrated 2-channel formula, rotated by this angle (degrees); overrides the saved calibration | `45` (LibrePods) |
-| `--raw-log` | Write every raw orientation sample to a CSV file | off |
+| `--mix-angle` | Uncalibrated LibrePods 2-channel formula, rotated by this angle (degrees); overrides the saved calibration | `45` (LibrePods) |
+| `--raw-log` | Write every head tracking packet (decoded channels, output and hex) to a CSV file | off |
 
 ### OpenTrack Setup
 

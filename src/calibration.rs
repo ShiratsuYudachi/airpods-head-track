@@ -1,45 +1,48 @@
-//! Guided calibration: fits the raw `(o1, o2, o3)` -> `(pitch, yaw, roll)`
-//! map from continuous head motion.
+//! Guided calibration: finds how the IMU is mounted relative to the head.
 //!
-//! For each head axis the user oscillates around that axis only. The samples
-//! (raw channel deltas from the neutral pose) are linearly detrended to drop
-//! slow drift, and the principal component of what remains is the raw-space
-//! direction that axis moves along. The three directions form the columns of
-//! the mixing matrix `D`; its inverse decouples the axes. Each row is scaled
-//! so the output keeps the LibrePods degree convention, and each direction's
-//! sign is chosen to agree with the uncalibrated formulas so axis signs do not
-//! flip after calibrating.
+//! For each head axis the user oscillates around that axis only, starting in
+//! the positive direction (down / right / right ear down). Every sample is the
+//! sensor-frame rotation from the neutral pose, as a rotation vector in
+//! degrees. After removing slow linear drift, the principal component of a
+//! phase is that head axis expressed in sensor coordinates; its sign comes
+//! from the first clear excursion. The three axes are orthonormalized
+//! (nearest orthogonal matrix) into the mounting calibration.
 
-use crate::head_tracking::{Calibration, DEG_PER_RAW};
+use crate::head_tracking::Calibration;
 use anyhow::{anyhow, bail, Context, Result};
 use log::{info, warn};
 use std::path::Path;
 
-/// One calibration sample: seconds since phase start, raw deltas from neutral.
+/// One calibration sample: seconds since phase start, sensor-frame rotation
+/// vector from the neutral pose in degrees.
 pub type Sample = (f64, [f64; 3]);
 
+/// Calibration file format version (3x3 head axes in sensor coordinates).
+const FORMAT_VERSION: u32 = 2;
 /// Fewer samples than this (~1 s of stream) cannot describe a motion.
 const MIN_SAMPLES: usize = 20;
-/// Minimum std along the motion direction, in raw units (~3 deg).
-const MIN_STD: f64 = 500.0;
-/// Below this share of variance on the main direction the motion was mixed.
+/// Minimum rotation std along the motion axis, degrees.
+const MIN_STD_DEG: f64 = 3.0;
+/// Below this share of rotation on the main axis the motion was mixed.
 const MIN_PURITY: f64 = 0.6;
 const WARN_PURITY: f64 = 0.85;
-/// Unit motion directions must span a real volume (1.0 = orthogonal).
+/// The three axes must span a real volume (1.0 = orthogonal).
 const MIN_DETERMINANT: f64 = 0.3;
+/// Share of the peak excursion that counts as the first deliberate move.
+const FIRST_MOVE_FRACTION: f64 = 0.3;
 
-/// Principal motion direction of one calibration phase.
+/// Head axis fitted from one calibration phase.
 #[derive(Debug, Clone, Copy)]
 pub struct AxisFit {
-    /// Unit direction in raw `(o1, o2, o3)` space (sign arbitrary).
+    /// Unit axis in sensor coordinates; positive = direction of first move.
     pub dir: [f64; 3],
-    /// Standard deviation along `dir`, raw units.
+    /// Rotation std along `dir`, degrees.
     pub std: f64,
-    /// Share of the phase's variance explained by `dir` (0..1).
+    /// Share of the phase's rotation explained by `dir` (0..1).
     pub purity: f64,
 }
 
-/// Principal motion direction of one phase, after removing linear drift.
+/// Fit one head axis from a phase's rotation vectors.
 pub fn fit_axis(samples: &[Sample]) -> Result<AxisFit> {
     if samples.len() < MIN_SAMPLES {
         bail!(
@@ -91,6 +94,19 @@ pub fn fit_axis(samples: &[Sample]) -> Result<AxisFit> {
     }
     let lambda = dot(v, mat_vec(&cov, v)).max(0.0);
 
+    // Positive direction = the first clear excursion from the starting pose.
+    let origin = samples[0].1;
+    let travel: Vec<f64> = samples
+        .iter()
+        .map(|s| dot(v, std::array::from_fn(|c| s.1[c] - origin[c])))
+        .collect();
+    let peak = travel.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    if let Some(first) = travel.iter().find(|x| x.abs() > FIRST_MOVE_FRACTION * peak) {
+        if *first < 0.0 {
+            v = v.map(|x| -x);
+        }
+    }
+
     Ok(AxisFit {
         dir: v,
         std: lambda.sqrt(),
@@ -98,14 +114,14 @@ pub fn fit_axis(samples: &[Sample]) -> Result<AxisFit> {
     })
 }
 
-/// Build the decoupling matrix from the three fitted motion directions.
+/// Combine the three fitted axes into the mounting calibration.
 pub fn build_calibration(pitch: AxisFit, yaw: AxisFit, roll: AxisFit) -> Result<Calibration> {
     let axes = [("pitch", pitch), ("yaw", yaw), ("roll", roll)];
     for (name, fit) in axes {
-        if fit.std < MIN_STD {
+        if fit.std < MIN_STD_DEG {
             bail!(
                 "{name} motion too small (~{:.1} deg); move further",
-                fit.std * DEG_PER_RAW as f64
+                fit.std
             );
         }
         if fit.purity < MIN_PURITY {
@@ -122,75 +138,59 @@ pub fn build_calibration(pitch: AxisFit, yaw: AxisFit, roll: AxisFit) -> Result<
         }
     }
 
-    // Sign references: the uncalibrated formulas (LibrePods pitch/yaw and
-    // the AirPods 4 roll fit from pods-head-tracker).
-    let references = [
-        [0.0, 1.0, 1.0],   // pitch = (o2 + o3) / 2
-        [0.0, 1.0, -1.0],  // yaw   = (o2 - o3) / 2
-        [1.0, -0.5, -0.5], // roll  = (o1 - (o2 + o3) / 2) / 2
-    ];
-    let mut dirs = [pitch.dir, yaw.dir, roll.dir];
-    for ((dir, reference), (name, _)) in dirs.iter_mut().zip(references).zip(axes) {
-        let agreement = dot(*dir, normalize(reference));
-        if agreement < 0.0 {
-            *dir = dir.map(|x| -x);
-        }
-        if agreement.abs() < 0.3 {
-            warn!("{name} direction is far from the default formula; its sign may be inverted (fix in opentrack Mapping if so)");
-        }
-    }
-
-    // D has the motion directions as columns.
-    let d = [
-        [dirs[0][0], dirs[1][0], dirs[2][0]],
-        [dirs[0][1], dirs[1][1], dirs[2][1]],
-        [dirs[0][2], dirs[1][2], dirs[2][2]],
-    ];
-    let det = det3(&d);
+    let a = [pitch.dir, yaw.dir, roll.dir];
+    let det = det3(&a);
     if det.abs() < MIN_DETERMINANT {
         bail!(
             "the three motions overlap too much (independence {:.2}); redo each axis separately",
             det.abs()
         );
     }
-    let inv = inverse3(&d, det);
 
-    // Gain: degrees per raw unit along each direction, matching the
-    // LibrePods convention (its pitch/yaw see the (o2, o3) projection / sqrt2).
-    let mut m = [[0.0f32; 3]; 3];
-    for (axis, dir) in dirs.iter().enumerate() {
-        let gain = dir[1].hypot(dir[2]) / std::f64::consts::SQRT_2 * DEG_PER_RAW as f64;
-        for c in 0..3 {
-            m[axis][c] = (gain * inv[axis][c]) as f32;
+    // Nearest orthogonal matrix (polar decomposition by Newton iteration):
+    // the mounting is a fixed rotation, so imperfect demonstrations must not
+    // become a permanent shear between the axes.
+    let mut q = a;
+    for _ in 0..50 {
+        let inv_t = transpose(&inverse3(&q));
+        q = std::array::from_fn(|i| std::array::from_fn(|j| 0.5 * (q[i][j] + inv_t[i][j])));
+    }
+    for (name, (fitted, orth)) in ["pitch", "yaw", "roll"].iter().zip(a.iter().zip(&q)) {
+        let deg = dot(*fitted, *orth).clamp(-1.0, 1.0).acos().to_degrees();
+        if deg > 15.0 {
+            warn!("{name} axis moved {deg:.0} deg when squaring up the axes; the motion may not have been about a single axis");
         }
     }
-    Ok(Calibration { m })
+    Ok(Calibration {
+        m: q.map(|row| row.map(|c| c as f32)),
+    })
 }
 
-/// RMS of each output axis while replaying one phase's (detrended) samples.
+/// RMS of each head-axis rotation while replaying one phase (detrended mean).
 /// For a clean phase only its own axis should be large.
 pub fn response_rms(cal: &Calibration, samples: &[Sample]) -> [f64; 3] {
     let n = samples.len().max(1) as f64;
     let mean: [f64; 3] = std::array::from_fn(|c| samples.iter().map(|s| s.1[c]).sum::<f64>() / n);
+    let m = cal.m.map(|row| row.map(f64::from));
     let mut acc = [0.0f64; 3];
     for s in samples {
-        let d = std::array::from_fn(|c| (s.1[c] - mean[c]) as f32);
-        let out = cal.apply(d);
-        for i in 0..3 {
-            acc[i] += (out[i] as f64).powi(2);
+        let d: [f64; 3] = std::array::from_fn(|c| s.1[c] - mean[c]);
+        for (a, row) in acc.iter_mut().zip(&m) {
+            *a += dot(*row, d).powi(2);
         }
     }
     acc.map(|a| (a / n).sqrt())
 }
 
-/// Save a calibration matrix.
+/// Save a calibration.
 pub fn save(path: &Path, cal: &Calibration) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut text = String::from(
-        "# airpods-head-track calibration: raw (o1,o2,o3) deltas -> (pitch,yaw,roll) degrees\n",
+        "# airpods-head-track calibration: rows = head pitch/yaw/roll axes in sensor coordinates\n",
     );
+    text.push_str(&format!("version={FORMAT_VERSION}\n"));
     for (r, row) in cal.m.iter().enumerate() {
         for (c, v) in row.iter().enumerate() {
             text.push_str(&format!("m{r}{c}={v}\n"));
@@ -200,13 +200,14 @@ pub fn save(path: &Path, cal: &Calibration) -> Result<()> {
     Ok(())
 }
 
-/// Load a calibration matrix. `Ok(None)` if the file does not exist.
+/// Load a calibration. `Ok(None)` if the file does not exist.
 pub fn load(path: &Path) -> Result<Option<Calibration>> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
+    let mut version = None;
     let mut vals = [[None; 3]; 3];
     for line in text.lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
@@ -215,20 +216,26 @@ pub fn load(path: &Path) -> Result<Option<Calibration>> {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        let key = key.trim().as_bytes();
+        let (key, value) = (key.trim(), value.trim());
+        if key == "version" {
+            version = Some(value.parse::<u32>()?);
+            continue;
+        }
+        let key = key.as_bytes();
         if key.len() == 3 && key[0] == b'm' {
             let (r, c) = ((key[1] - b'0') as usize, (key[2] - b'0') as usize);
             if r < 3 && c < 3 {
-                vals[r][c] = Some(value.trim().parse::<f32>()?);
+                vals[r][c] = Some(value.parse::<f32>()?);
             }
         }
+    }
+    if version != Some(FORMAT_VERSION) {
+        bail!("calibration file is from an older version");
     }
     let mut m = [[0.0f32; 3]; 3];
     for r in 0..3 {
         for c in 0..3 {
-            m[r][c] = vals[r][c].ok_or_else(|| {
-                anyhow!("calibration file is incomplete or from an older version")
-            })?;
+            m[r][c] = vals[r][c].ok_or_else(|| anyhow!("calibration file is incomplete"))?;
         }
     }
     Ok(Some(Calibration { m }))
@@ -236,9 +243,9 @@ pub fn load(path: &Path) -> Result<Option<Calibration>> {
 
 /// Log the fit quality of a finished calibration.
 pub fn report(cal: &Calibration, phases: [(&str, &[Sample]); 3]) {
-    info!("Calibration matrix (rows pitch/yaw/roll):");
-    for row in &cal.m {
-        info!("  [{:+.6} {:+.6} {:+.6}]", row[0], row[1], row[2]);
+    info!("Calibration (head axes in sensor coordinates):");
+    for (name, row) in ["pitch", "yaw", "roll"].iter().zip(&cal.m) {
+        info!("  {name:5} [{:+.3} {:+.3} {:+.3}]", row[0], row[1], row[2]);
     }
     for (axis, (name, samples)) in phases.into_iter().enumerate() {
         let rms = response_rms(cal, samples);
@@ -274,13 +281,18 @@ fn mat_vec(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
     std::array::from_fn(|i| dot(m[i], v))
 }
 
+fn transpose(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    std::array::from_fn(|i| std::array::from_fn(|j| m[j][i]))
+}
+
 fn det3(m: &[[f64; 3]; 3]) -> f64 {
     m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
 }
 
-fn inverse3(m: &[[f64; 3]; 3], det: f64) -> [[f64; 3]; 3] {
+fn inverse3(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let det = det3(m);
     let c =
         |r0: usize, r1: usize, c0: usize, c1: usize| m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0];
     [
@@ -306,107 +318,95 @@ fn inverse3(m: &[[f64; 3]; 3], det: f64) -> [[f64; 3]; 3] {
 mod tests {
     use super::*;
 
-    /// Raw-space response per degree of each head axis for a sensor following
-    /// the AirPods 4 model (o1 = pitch + roll, (o2+o3)/2 = pitch - roll,
-    /// (o2-o3)/2 = yaw), then rotated by `mount` to mimic a skewed IMU.
-    fn mixing(mount: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-        let k = 1.0 / DEG_PER_RAW as f64;
-        let base = [
-            [k, k, k],    // pitch
-            [0.0, k, -k], // yaw
-            [k, -k, -k],  // roll
-        ];
-        base.map(|v| mat_vec(&mount, v))
+    /// Head axes (rows) in sensor coordinates for a skewed mount.
+    fn mount() -> [[f64; 3]; 3] {
+        let (s1, c1) = 25f64.to_radians().sin_cos();
+        let (s2, c2) = 40f64.to_radians().sin_cos();
+        let rx = [[1.0, 0.0, 0.0], [0.0, c1, -s1], [0.0, s1, c1]];
+        let rz = [[c2, -s2, 0.0], [s2, c2, 0.0], [0.0, 0.0, 1.0]];
+        std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| rx[i][k] * rz[k][j]).sum()))
     }
 
-    /// Oscillate one head axis (degrees) with drift and cross-axis wobble.
-    fn phase(mix: &[[f64; 3]; 3], axis: usize) -> Vec<Sample> {
-        (0..200)
+    /// One phase: oscillate `axis`, first move in direction `first`, plus an
+    /// involuntary wobble on the next axis and slow drift on the third.
+    fn phase(m: &[[f64; 3]; 3], axis: usize, first: f64, seconds: f64) -> Vec<Sample> {
+        let n = (seconds / 0.043) as usize;
+        (0..n)
             .map(|i| {
-                let t = i as f64 * 0.04;
+                let t = i as f64 * 0.043;
                 let mut head = [0.0; 3];
-                head[axis] = 25.0 * (t * 3.0).sin();
-                head[(axis + 1) % 3] += 1.5 * (t * 7.3).sin(); // involuntary wobble
-                head[(axis + 2) % 3] += 0.4 * t; // slow drift
-                let raw = std::array::from_fn(|c| (0..3).map(|a| head[a] * mix[a][c]).sum::<f64>());
-                (t, raw)
+                head[axis] = first * 25.0 * (t * 3.5).sin();
+                head[(axis + 1) % 3] += 1.5 * (t * 7.3).sin();
+                head[(axis + 2) % 3] += 0.4 * t;
+                // Sensor rotation vector = sum of head angle * head axis.
+                (
+                    t,
+                    std::array::from_fn(|c| (0..3).map(|a| head[a] * m[a][c]).sum()),
+                )
             })
             .collect()
     }
 
-    fn rot_x(deg: f64) -> [[f64; 3]; 3] {
-        let (s, c) = deg.to_radians().sin_cos();
-        [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
-    }
-
-    fn rot_z(deg: f64) -> [[f64; 3]; 3] {
-        let (s, c) = deg.to_radians().sin_cos();
-        [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
-    }
-
-    fn matmul(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-        std::array::from_fn(|i| std::array::from_fn(|j| (0..3).map(|k| a[i][k] * b[k][j]).sum()))
-    }
-
-    fn calibrate(mix: &[[f64; 3]; 3]) -> Result<Calibration> {
-        let fits: Vec<AxisFit> = (0..3).map(|a| fit_axis(&phase(mix, a)).unwrap()).collect();
+    fn calibrate(m: &[[f64; 3]; 3], firsts: [f64; 3], seconds: f64) -> Result<Calibration> {
+        let fits: Vec<AxisFit> = (0..3)
+            .map(|a| fit_axis(&phase(m, a, firsts[a], seconds)).unwrap())
+            .collect();
         build_calibration(fits[0], fits[1], fits[2])
     }
 
     #[test]
-    fn skewed_mount_is_decoupled_with_correct_signs() {
-        let mix = mixing(matmul(rot_x(25.0), rot_z(15.0)));
-        let cal = calibrate(&mix).unwrap();
-        for axis in 0..3 {
-            let raw = mix[axis].map(|x| (x * 10.0) as f32); // +10 deg on one axis
-            let out = cal.apply(raw);
-            assert!(out[axis] > 5.0, "axis {axis} lost or flipped: {out:?}");
-            for other in (0..3).filter(|&o| o != axis) {
-                assert!(
-                    out[other].abs() < 0.05 * out[axis],
-                    "axis {axis} leaks into {other}: {out:?}"
-                );
-            }
+    fn recovers_skewed_mount_in_four_seconds() {
+        let m = mount();
+        let cal = calibrate(&m, [1.0, 1.0, 1.0], 4.0).unwrap();
+        for (axis, (got, want)) in cal.m.iter().zip(&m).enumerate() {
+            let got = got.map(f64::from);
+            let cos = dot(got, *want);
+            assert!(cos > 0.995, "axis {axis}: {got:?} vs {want:?}");
         }
     }
 
     #[test]
-    fn in_plane_twist_keeps_degree_scale() {
-        // A twist within the (o2, o3) plane must not change the degree gain.
-        let mix = mixing(rot_x(30.0));
-        let cal = calibrate(&mix).unwrap();
-        for axis in 0..3 {
-            let out = cal.apply(mix[axis].map(|x| (x * 10.0) as f32));
-            assert!((out[axis] - 10.0).abs() < 0.5, "axis {axis}: {out:?}");
-        }
+    fn first_move_defines_positive_direction() {
+        let m = mount();
+        // User started the yaw phase by turning the other way: the fitted yaw
+        // axis must point the other way too, so "first move" stays positive.
+        let cal = calibrate(&m, [1.0, -1.0, 1.0], 4.0).unwrap();
+        assert!(dot(cal.m[1].map(f64::from), m[1]) < -0.995);
+        assert!(dot(cal.m[0].map(f64::from), m[0]) > 0.995);
     }
 
     #[test]
     fn rejects_overlapping_motions() {
-        let mix = mixing(rot_x(0.0));
-        let pitch = fit_axis(&phase(&mix, 0)).unwrap();
-        let yaw = fit_axis(&phase(&mix, 1)).unwrap();
+        let m = mount();
+        let pitch = fit_axis(&phase(&m, 0, 1.0, 4.0)).unwrap();
+        let yaw = fit_axis(&phase(&m, 1, 1.0, 4.0)).unwrap();
         // "Roll" phase that actually repeated the pitch motion.
         assert!(build_calibration(pitch, yaw, pitch).is_err());
     }
 
     #[test]
     fn rejects_motion_that_is_too_small() {
-        let mix = mixing(rot_x(0.0));
-        let still: Vec<Sample> = phase(&mix, 0)
+        let m = mount();
+        let still: Vec<Sample> = phase(&m, 0, 1.0, 4.0)
             .into_iter()
-            .map(|(t, raw)| (t, raw.map(|x| x * 0.01)))
+            .map(|(t, r)| (t, r.map(|x| x * 0.05)))
             .collect();
         let pitch = fit_axis(&still).unwrap();
-        let yaw = fit_axis(&phase(&mix, 1)).unwrap();
-        let roll = fit_axis(&phase(&mix, 2)).unwrap();
+        let yaw = fit_axis(&phase(&m, 1, 1.0, 4.0)).unwrap();
+        let roll = fit_axis(&phase(&m, 2, 1.0, 4.0)).unwrap();
         assert!(build_calibration(pitch, yaw, roll).is_err());
     }
 
     #[test]
-    fn old_two_by_two_file_is_rejected() {
+    fn older_calibration_files_are_rejected() {
         let path = std::env::temp_dir().join("aht_cal_old_format_test.txt");
-        std::fs::write(&path, "m00=1\nm01=0\nm10=0\nm11=1\n").unwrap();
+        let mut text = String::new();
+        for r in 0..3 {
+            for c in 0..3 {
+                text.push_str(&format!("m{r}{c}=0.5\n"));
+            }
+        }
+        std::fs::write(&path, text).unwrap();
         let result = load(&path);
         std::fs::remove_file(&path).ok();
         assert!(result.is_err());
@@ -419,8 +419,8 @@ mod tests {
             m: [[0.1, -0.2, 0.3], [0.004, 0.5, -0.6], [7.0, 0.08, -0.009]],
         };
         save(&path, &cal).unwrap();
-        let loaded = load(&path).unwrap();
+        let loaded = load(&path);
         std::fs::remove_file(&path).ok();
-        assert_eq!(loaded, Some(cal));
+        assert_eq!(loaded.unwrap(), Some(cal));
     }
 }
