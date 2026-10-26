@@ -1,6 +1,7 @@
 //! Head tracking data parser and orientation calculator.
 //!
-//! The three int16 orientation channels at packet offsets 43/45/47 are the
+//! The three int16 orientation channels at offset 20 of the sensor block (see
+//! `AacpManager::head_tracking_sensor_block`) are the
 //! vector part `(x, y, z)` of the sensor's orientation quaternion in Q15. The
 //! scalar part is not sent: it is implied as `w = sqrt(1 - |v|^2) >= 0`, so
 //! whenever the true `w` crosses zero the AirPods flip the sign of all three
@@ -11,6 +12,7 @@
 //! `q_neutral^-1 * q`. A fitted calibration maps it into head axes and splits
 //! it into yaw/pitch/roll; without one, the LibrePods linear formula is used.
 
+use crate::aacp::AacpManager;
 use log::debug;
 
 /// Raw orientation units per degree convention used by LibrePods:
@@ -119,13 +121,11 @@ impl HeadTracker {
     /// Process a head tracking packet. Returns `None` while the neutral pose
     /// is being captured.
     pub fn process_packet(&mut self, packet: &[u8]) -> Option<(Orientation, Acceleration)> {
-        if packet.len() < 55 {
-            return None;
-        }
-        let q = quat_from_raw(raw_orientation(packet)?);
+        let block = AacpManager::head_tracking_sensor_block(packet)?;
+        let q = quat_from_raw(block_orientation(block));
         let acceleration = Acceleration {
-            horizontal: bytes_to_i16(packet[51], packet[52]) as f32,
-            vertical: bytes_to_i16(packet[53], packet[54]) as f32,
+            horizontal: bytes_to_i16(block[28], block[29]) as f32,
+            vertical: bytes_to_i16(block[30], block[31]) as f32,
         };
 
         let Some(neutral) = self.neutral else {
@@ -182,14 +182,16 @@ impl HeadTracker {
 
 /// Raw orientation channels `(o1, o2, o3)` of a head tracking packet.
 pub fn raw_orientation(packet: &[u8]) -> Option<[i32; 3]> {
-    if packet.len() < 49 {
-        return None;
-    }
-    Some([
-        bytes_to_i16(packet[43], packet[44]) as i32,
-        bytes_to_i16(packet[45], packet[46]) as i32,
-        bytes_to_i16(packet[47], packet[48]) as i32,
-    ])
+    AacpManager::head_tracking_sensor_block(packet).map(block_orientation)
+}
+
+/// Orientation channels at offset 20 of the sensor block.
+fn block_orientation(block: &[u8]) -> [i32; 3] {
+    [
+        bytes_to_i16(block[20], block[21]) as i32,
+        bytes_to_i16(block[22], block[23]) as i32,
+        bytes_to_i16(block[24], block[25]) as i32,
+    ]
 }
 
 /// Reconstruct the unit quaternion from the three transmitted Q15 components
@@ -319,10 +321,11 @@ mod tests {
         [c, s * axis[0] / n, s * axis[1] / n, s * axis[2] / n]
     }
 
-    /// Encode a quaternion the way the AirPods send it: w >= 0, vector in Q15.
+    /// Encode a quaternion the way the AirPods send it (w >= 0, vector in
+    /// Q15) into a real captured sensor packet.
     fn packet_for(q: Quat) -> Vec<u8> {
         let q = if q[0] < 0.0 { q.map(|c| -c) } else { q };
-        let mut p = vec![0u8; 70];
+        let mut p = crate::aacp::sample_sensor_packet();
         for i in 0..3 {
             let b = ((q[i + 1] * Q15).round() as i16).to_le_bytes();
             p[43 + 2 * i] = b[0];

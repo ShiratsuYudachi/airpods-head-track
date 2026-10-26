@@ -10,7 +10,7 @@ AirPods (particularly AirPods Pro and later) broadcast head tracking data over B
 2. This tool enumerates connected AirPods via the driver's device interface GUID (`{9eec98bb-3c54-45d4-a843-7900c4635e08}`), opens a handle with `CreateFile`, and performs AACP handshake/communication over overlapped `ReadFile`/`WriteFile`.
 3. Head tracking orientation data is parsed from AACP packets, calibrated to a neutral position, and sent to OpenTrack as 6 doubles (yaw, pitch, roll) over UDP on `127.0.0.1:4242`.
 
-The three orientation channels at packet offsets 43/45/47 are the vector part `(x, y, z)` of the sensor's orientation quaternion in Q15. The scalar part is not sent; it is implied as `w = sqrt(1 - |v|²) ≥ 0`. Whenever the true `w` crosses zero the AirPods therefore flip the sign of all three channels (`q` and `-q` are the same rotation). Head motion is computed as the quaternion rotation from the neutral pose, so these flips have no effect on the output.
+Head tracking packets are `04 00 04 00 17 00 00 00 10 00`, a u16 length, then a protobuf-encoded body; the sensor data is bytes field 3 inside field 7. A varint before it changes size (packets are 81 or 80 bytes), so the sensor block is located by parsing, not at a fixed offset. Its three orientation channels (offset 20) are the vector part `(x, y, z)` of the sensor's orientation quaternion in Q15. The scalar part is not sent; it is implied as `w = sqrt(1 - |v|²) ≥ 0`. Whenever the true `w` crosses zero the AirPods therefore flip the sign of all three channels (`q` and `-q` are the same rotation). Head motion is computed as the quaternion rotation from the neutral pose, so these flips have no effect on the output.
 
 ## Prerequisites
 

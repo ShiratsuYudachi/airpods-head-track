@@ -152,7 +152,7 @@ fn main() -> Result<()> {
         Some(path) => {
             let file = std::fs::File::create(path)?;
             let mut writer = std::io::BufWriter::new(file);
-            writeln!(writer, "t,len,sub,o1,o2,o3,o4,h,v,pitch,yaw,roll,hex")?;
+            writeln!(writer, "t,len,o1,o2,o3,pitch,yaw,roll,hex")?;
             info!("Raw orientation log: {}", path.display());
             Some(writer)
         }
@@ -205,8 +205,7 @@ fn main() -> Result<()> {
                     let result = tracker.process_packet(packet);
 
                     if let Some(writer) = &mut raw_log {
-                        let s =
-                            |off: usize| i16::from_le_bytes([packet[off], packet[off + 1]]) as i32;
+                        let o = raw_orientation(packet).unwrap_or_default();
                         let out = match &result {
                             Some((o, _)) => format!("{:.2},{:.2},{:.2}", o.pitch, o.yaw, o.roll),
                             None => ",,".to_string(),
@@ -214,16 +213,12 @@ fn main() -> Result<()> {
                         let hex: String = packet.iter().map(|b| format!("{b:02x}")).collect();
                         let _ = writeln!(
                             writer,
-                            "{:.4},{},{:02x},{},{},{},{},{},{},{},{}",
+                            "{:.4},{},{},{},{},{},{}",
                             log_start.elapsed().as_secs_f64(),
                             packet.len(),
-                            packet[10],
-                            s(43),
-                            s(45),
-                            s(47),
-                            s(49),
-                            s(51),
-                            s(53),
+                            o[0],
+                            o[1],
+                            o[2],
                             out,
                             hex
                         );
