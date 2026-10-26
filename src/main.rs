@@ -378,10 +378,10 @@ fn run_calibration(conn: &BtConnection, calibration_path: &Path) -> Result<Calib
         conn,
         "2/4  NOD (pitch)",
         &[
-            "Chin DOWN toward your chest (~20 deg), then UP past centre (~20 deg), repeat.",
+            "Chin UP (~20 deg), then DOWN toward your chest past centre (~20 deg), repeat.",
             "Keep facing the screen: no turning, no tilting.",
         ],
-        "chin DOWN first, then up / down",
+        "chin UP first, then down / up",
         MOTION_SECONDS,
     );
     let yaw_raw = guided_capture(

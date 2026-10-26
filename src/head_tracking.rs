@@ -47,7 +47,7 @@ pub struct Acceleration {
 
 /// IMU mounting calibration: rows are the head's pitch, yaw and roll axes
 /// expressed in sensor coordinates (orthonormal). Each axis points so that a
-/// positive rotation about it is looking down / turning right / tilting the
+/// positive rotation about it is looking up / turning right / tilting the
 /// right ear toward the right shoulder.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Calibration {
@@ -380,7 +380,7 @@ mod tests {
             let neutral = near_flip();
             assert!(tracker.process_packet(&packet_for(neutral)).is_none());
 
-            // Head: turn right 30, look down 20, tilt right 10 (about the
+            // Head: turn right 30, look up 20, tilt right 10 (about the
             // calibrated axes, positive = calibrated direction).
             let yaw = axis_angle(m[1], 30.0);
             let pitch = axis_angle(m[0], 20.0);

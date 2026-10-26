@@ -1,7 +1,7 @@
 //! Guided calibration: finds how the IMU is mounted relative to the head.
 //!
 //! For each head axis the user oscillates around that axis only, starting in
-//! the positive direction (down / right / right ear down). Every sample is the
+//! the positive direction (up / right / right ear down, OpenTrack's signs). Every sample is the
 //! sensor-frame rotation from the neutral pose, as a rotation vector in
 //! degrees. After removing slow linear drift, the principal component of a
 //! phase is that head axis expressed in sensor coordinates; its sign comes
@@ -19,7 +19,8 @@ use std::path::Path;
 pub type Sample = (f64, [f64; 3]);
 
 /// Calibration file format version (3x3 head axes in sensor coordinates).
-const FORMAT_VERSION: u32 = 2;
+/// Version 3: the pitch axis points up (version 2 pointed down).
+const FORMAT_VERSION: u32 = 3;
 /// Fewer samples than this (~1 s of stream) cannot describe a motion.
 const MIN_SAMPLES: usize = 20;
 /// Minimum rotation std along the motion axis, degrees.
