@@ -156,35 +156,13 @@ impl<'a> AacpManager<'a> {
     /// Send the "start head tracking" command.
     pub fn start_head_tracking(&self) -> Result<()> {
         info!("Starting head tracking...");
-        let payload: [u8; 22] = [
-            opcodes::HEADTRACKING,
-            0x00,
-            0x00,
-            0x00,
-            0x10,
-            0x00,
-            0x10,
-            0x00,
-            0x08,
-            0xA1,
-            0x02,
-            0x42,
-            0x0B,
-            0x08,
-            0x0E,
-            0x10,
-            0x02,
-            0x1A,
-            0x05,
-            0x01,
-            0x40,
-            0x9C,
+        // Alternate start packet (LibrePods default; required by AirPods 4 / newer firmware)
+        let payload: [u8; 23] = [
+            0x17, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0F, 0x00, 0x08, 0x73, 0x42, 0x0B, 0x08, 0x10,
+            0x10, 0x02, 0x1A, 0x05, 0x01, 0x40, 0x9C, 0x00, 0x00,
         ];
-        // The packet from the Android source also sends two trailing 0x00 bytes
-        let mut full_payload = payload.to_vec();
-        full_payload.extend_from_slice(&[0x00, 0x00]);
 
-        let packet = Self::make_data_packet(&full_payload);
+        let packet = Self::make_data_packet(&payload);
         self.conn
             .send(&packet)
             .context("Failed to send start head tracking")?;
@@ -196,34 +174,11 @@ impl<'a> AacpManager<'a> {
     pub fn stop_head_tracking(&self) -> Result<()> {
         info!("Stopping head tracking...");
         let payload: [u8; 23] = [
-            opcodes::HEADTRACKING,
-            0x00,
-            0x00,
-            0x00,
-            0x10,
-            0x00,
-            0x11,
-            0x00,
-            0x08,
-            0x7E,
-            0x10,
-            0x02,
-            0x42,
-            0x0B,
-            0x08,
-            0x4E,
-            0x10,
-            0x02,
-            0x1A,
-            0x05,
-            0x01,
-            0x00,
-            0x00,
+            0x17, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0F, 0x00, 0x08, 0x75, 0x42, 0x0B, 0x08, 0x10,
+            0x10, 0x02, 0x1A, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
         ];
-        let mut full_payload = payload.to_vec();
-        full_payload.extend_from_slice(&[0x00, 0x00]);
 
-        let packet = Self::make_data_packet(&full_payload);
+        let packet = Self::make_data_packet(&payload);
         self.conn
             .send(&packet)
             .context("Failed to send stop head tracking")?;
