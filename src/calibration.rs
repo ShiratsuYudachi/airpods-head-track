@@ -5,8 +5,9 @@
 //! sensor-frame rotation from the neutral pose, as a rotation vector in
 //! degrees. After removing slow linear drift, the principal component of a
 //! phase is that head axis expressed in sensor coordinates; its sign comes
-//! from the first clear excursion. The three axes are orthonormalized
-//! (nearest orthogonal matrix) into the mounting calibration.
+//! from the first clear excursion away from the neutral pose. The three axes
+//! are orthonormalized (nearest orthogonal matrix) into the mounting
+//! calibration.
 
 use crate::head_tracking::Calibration;
 use anyhow::{anyhow, bail, Context, Result};
@@ -34,7 +35,7 @@ const FIRST_MOVE_FRACTION: f64 = 0.3;
 /// Head axis fitted from one calibration phase.
 #[derive(Debug, Clone, Copy)]
 pub struct AxisFit {
-    /// Unit axis in sensor coordinates; positive = direction of first move.
+    /// Unit axis in sensor coordinates; positive = first excursion from neutral.
     pub dir: [f64; 3],
     /// Rotation std along `dir`, degrees.
     pub std: f64,
@@ -94,12 +95,11 @@ pub fn fit_axis(samples: &[Sample]) -> Result<AxisFit> {
     }
     let lambda = dot(v, mat_vec(&cov, v)).max(0.0);
 
-    // Positive direction = the first clear excursion from the starting pose.
-    let origin = samples[0].1;
-    let travel: Vec<f64> = samples
-        .iter()
-        .map(|s| dot(v, std::array::from_fn(|c| s.1[c] - origin[c])))
-        .collect();
+    // Positive direction = the first clear excursion away from the neutral
+    // pose (samples are rotations from neutral). Measuring from the phase's
+    // first sample would invert the axis when the user already moved during
+    // the countdown and the phase starts at the far end of the motion.
+    let travel: Vec<f64> = samples.iter().map(|s| dot(v, s.1)).collect();
     let peak = travel.iter().fold(0.0f64, |m, x| m.max(x.abs()));
     if let Some(first) = travel.iter().find(|x| x.abs() > FIRST_MOVE_FRACTION * peak) {
         if *first < 0.0 {
@@ -373,6 +373,23 @@ mod tests {
         let cal = calibrate(&m, [1.0, -1.0, 1.0], 4.0).unwrap();
         assert!(dot(cal.m[1].map(f64::from), m[1]) < -0.995);
         assert!(dot(cal.m[0].map(f64::from), m[0]) > 0.995);
+    }
+
+    #[test]
+    fn moving_during_countdown_keeps_sign() {
+        // As in a real run: the user started turning right during the
+        // countdown, so the yaw phase begins already 42 deg to the right and
+        // the first move after GO is back toward the left.
+        let m = mount();
+        let yaw: Vec<Sample> = phase(&m, 1, 1.0, 4.0)
+            .into_iter()
+            .map(|(t, _)| {
+                let angle = 42.0 * (t * 3.5).cos();
+                (t, m[1].map(|c| c * angle))
+            })
+            .collect();
+        let fit = fit_axis(&yaw).unwrap();
+        assert!(dot(fit.dir, m[1]) > 0.995, "yaw flipped: {:?}", fit.dir);
     }
 
     #[test]
